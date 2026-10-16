@@ -1,0 +1,66 @@
+name: probe
+
+on:
+  schedule:
+    - cron: "0 6 * * *"          # daily; a real probe would run more often
+  workflow_dispatch:
+    inputs:
+      url:
+        description: URL to probe (use a bad one to see the failure path)
+        default: "https://api.github.com/zen"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe the URL
+        id: probe
+        env:
+          URL: ${{ inputs.url || 'https://api.github.com/zen' }}
+        run: |
+          set +e
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --retry 2 --retry-delay 2 "$URL")
+          rc=$?
+          ok=false
+          if [ "$rc" -eq 0 ] && [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then ok=true; fi
+          {
+            echo "url=$URL"
+            echo "code=$code"
+            echo "ok=$ok"
+          } >> "$GITHUB_OUTPUT"
+          echo "probe $URL -> http $code (curl exit $rc), ok=$ok" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue on failure, close it on recovery
+        uses: actions/github-script@v9
+        env:
+          OK: ${{ steps.probe.outputs.ok }}
+          URL: ${{ steps.probe.outputs.url }}
+          CODE: ${{ steps.probe.outputs.code }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({ owner, repo, labels: 'uptime', state: 'open' });
+            const existing = open.data[0];
+            const ok = process.env.OK === 'true';
+            if (!ok && !existing) {
+              await github.rest.issues.create({
+                owner, repo, labels: ['uptime'],
+                title: `Probe failing: ${process.env.URL}`,
+                body: `The probe got HTTP ${process.env.CODE} at ${new Date().toISOString()}.`,
+              });
+            } else if (!ok && existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Still failing (HTTP ${process.env.CODE}) at ${new Date().toISOString()}.`,
+              });
+            } else if (ok && existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Recovered (HTTP ${process.env.CODE}) at ${new Date().toISOString()}.`,
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' });
+            }
